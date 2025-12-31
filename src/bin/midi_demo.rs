@@ -480,7 +480,10 @@ fn run_cancellation(midi: Rc<RefCell<MidiSender>>, _running: Arc<AtomicBool>) {
                         });
 
                         // Would play for 10 seconds if not cancelled
-                        let _ = c.wait(20.0).await;
+                        if c.wait(20.0).await.is_err() {
+                            // Cancelled! Exit early - handle_cancel already ran
+                            return;
+                        }
                         println!("  (This shouldn't print - we cancel before it completes)");
                     }
                 },
