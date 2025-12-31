@@ -1,20 +1,31 @@
 //! Timing Engine Determinism Test Suite
 //!
 //! This module is a direct port of the TypeScript timing_tests.ts test suite.
-//! It tests deterministic logical-time scheduling across offline mode.
+//! It tests deterministic logical-time scheduling across both offline and realtime modes.
 //!
 //! The suite assumes the engine provides these guarantees:
-//! 1) Deterministic logical-time ordering
+//! 1) Deterministic logical-time ordering across realtime vs offline
+//!    - same initial state
+//!    - no shared-state mutation outside scheduler-driven continuations
 //! 2) Deterministic tie-breaking for events at the same logical timestamp
-//! 3) Seeded randomness
+//!    - ordering is arbitrary but stable (defined by scheduler sequence numbers)
+//! 3) Seeded randomness:
+//!    - RNG is forked per context by default (unless explicitly shared)
+//!
+//! Therefore, we can compare event ORDER strictly between offline and realtime modes
+//! (no windowed order tolerance). We still keep a small time epsilon for safety.
 
 #[cfg(test)]
 mod tests {
     use crate::barrier::{await_barrier, clear_all_barriers, resolve_barrier, start_barrier};
     use crate::context::{BranchOptions, Ctx, RngMode, TempoMode};
-    use crate::engine::{EngineConfig, OfflineRunner};
+    use crate::engine::{EngineConfig, OfflineRunner, RealtimeRunner};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    /// Speed multiplier for realtime tests to make them fast.
+    /// At 100x, a 1-second logical duration only takes 10ms wall time.
+    const REALTIME_RATE: f64 = 100.0;
 
     /// A logged event for comparison
     #[derive(Clone, Debug)]
@@ -25,6 +36,87 @@ mod tests {
         ctx_id: u64,
         note: Option<String>,
         value: Option<f64>,
+    }
+
+    /// Test tolerances for comparison
+    struct TestTolerances {
+        time_eps_sec: f64,
+        value_eps: f64,
+    }
+
+    impl Default for TestTolerances {
+        fn default() -> Self {
+            Self {
+                time_eps_sec: 1e-6,  // 1 microsecond
+                value_eps: 1e-12,    // very tight for RNG values
+            }
+        }
+    }
+
+    /// Compare two runs (offline vs realtime) for deterministic equivalence.
+    fn compare_deterministic_runs(
+        label: &str,
+        offline_events: &[LoggedEvent],
+        realtime_events: &[LoggedEvent],
+        tolerances: &TestTolerances,
+    ) {
+        // Check counts match
+        assert_eq!(
+            offline_events.len(),
+            realtime_events.len(),
+            "[{}] Event count mismatch: offline={}, realtime={}",
+            label,
+            offline_events.len(),
+            realtime_events.len()
+        );
+
+        // Check each event matches
+        for (i, (o, r)) in offline_events.iter().zip(realtime_events.iter()).enumerate() {
+            // Check IDs match (strict order)
+            assert_eq!(
+                o.id, r.id,
+                "[{}] Event order mismatch at index {}.\nOffline: {:?}\nRealtime: {:?}",
+                label, i, o.id, r.id
+            );
+
+            // Check times match within tolerance
+            assert!(
+                (o.t - r.t).abs() <= tolerances.time_eps_sec,
+                "[{}] Time mismatch for '{}': offline={:.9}, realtime={:.9}, eps={}",
+                label,
+                o.id,
+                o.t,
+                r.t,
+                tolerances.time_eps_sec
+            );
+
+            // Check values match if present
+            match (&o.value, &r.value) {
+                (Some(ov), Some(rv)) => {
+                    assert!(
+                        (ov - rv).abs() <= tolerances.value_eps,
+                        "[{}] Value mismatch for '{}': offline={}, realtime={}, eps={}",
+                        label,
+                        o.id,
+                        ov,
+                        rv,
+                        tolerances.value_eps
+                    );
+                }
+                (None, None) => {}
+                _ => panic!(
+                    "[{}] Value presence mismatch at '{}': offline={:?}, realtime={:?}",
+                    label, o.id, o.value, r.value
+                ),
+            }
+
+            // Check notes match if present
+            assert_eq!(
+                o.note, r.note,
+                "[{}] Note mismatch for '{}': offline={:?}, realtime={:?}",
+                label, o.id, o.note, r.note
+            );
+        }
     }
 
     /// Assert that events are as expected
@@ -1754,5 +1846,2043 @@ mod tests {
         assert!((branch_start.t - 0.5).abs() < 1e-6);
         assert!((branch_end.t - 0.8).abs() < 1e-6);
         assert!((parent_after.t - 0.8).abs() < 1e-6);
+    }
+
+    // ==================== DUAL-MODE TESTS (Offline vs Realtime) ====================
+    // These tests run the same scenario in both offline and realtime modes,
+    // then compare the event logs to verify deterministic equivalence.
+
+    /// Test: dual_mode_sequential_waitSec
+    /// Verifies that sequential waits produce identical events in both modes
+    #[test]
+    fn test_dual_mode_sequential_wait_sec() {
+        clear_all_barriers();
+
+        let test_name = "dual_mode_sequential_waitSec";
+
+        // Run offline
+        let offline_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = OfflineRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                        let _ = ctx.wait_sec(0.05).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "t=0.05".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                        let _ = ctx.wait_sec(0.10).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "t=0.15".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                        let _ = ctx.wait_sec(0.20).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "t=0.35".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    ..Default::default()
+                },
+            );
+            runner.step_sec(0.5);
+            { let v = events.borrow().clone(); v }
+        };
+
+        clear_all_barriers();
+
+        // Run realtime (with high rate for speed)
+        let realtime_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = RealtimeRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                        let _ = ctx.wait_sec(0.05).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "t=0.05".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                        let _ = ctx.wait_sec(0.10).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "t=0.15".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                        let _ = ctx.wait_sec(0.20).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "t=0.35".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    rate: REALTIME_RATE,
+                    ..Default::default()
+                },
+            );
+            runner.run_until_complete();
+            { let v = events.borrow().clone(); v }
+        };
+
+        compare_deterministic_runs(
+            test_name,
+            &offline_events,
+            &realtime_events,
+            &TestTolerances::default(),
+        );
+    }
+
+    /// Test: dual_mode_parallel_branchWait
+    /// Verifies that parallel branches produce identical events in both modes
+    #[test]
+    fn test_dual_mode_parallel_branch_wait() {
+        clear_all_barriers();
+
+        let test_name = "dual_mode_parallel_branchWait";
+
+        // Run offline
+        let offline_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = OfflineRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let events_a = events.clone();
+                        let a = ctx.branch_wait(
+                            move |c| {
+                                let events = events_a;
+                                async move {
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_start".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                    let _ = c.wait_sec(0.20).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_end".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let events_b = events.clone();
+                        let b = ctx.branch_wait(
+                            move |c| {
+                                let events = events_b;
+                                async move {
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B_start".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                    let _ = c.wait_sec(0.10).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B_end".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let _ = a.await;
+                        let _ = b.await;
+                        let _ = ctx.wait(0.0).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "joined".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    ..Default::default()
+                },
+            );
+            runner.step_sec(0.5);
+            { let v = events.borrow().clone(); v }
+        };
+
+        clear_all_barriers();
+
+        // Run realtime
+        let realtime_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = RealtimeRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let events_a = events.clone();
+                        let a = ctx.branch_wait(
+                            move |c| {
+                                let events = events_a;
+                                async move {
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_start".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                    let _ = c.wait_sec(0.20).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_end".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let events_b = events.clone();
+                        let b = ctx.branch_wait(
+                            move |c| {
+                                let events = events_b;
+                                async move {
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B_start".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                    let _ = c.wait_sec(0.10).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B_end".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let _ = a.await;
+                        let _ = b.await;
+                        let _ = ctx.wait(0.0).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "joined".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    rate: REALTIME_RATE,
+                    ..Default::default()
+                },
+            );
+            runner.run_until_complete();
+            { let v = events.borrow().clone(); v }
+        };
+
+        compare_deterministic_runs(
+            test_name,
+            &offline_events,
+            &realtime_events,
+            &TestTolerances::default(),
+        );
+    }
+
+    /// Test: dual_mode_deterministic_tie_break
+    /// Verifies that tie-breaking is identical in both modes
+    #[test]
+    fn test_dual_mode_deterministic_tie_break() {
+        clear_all_barriers();
+
+        let test_name = "dual_mode_deterministic_tie_break";
+
+        // Run offline
+        let (offline_events, offline_shared) = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let shared = Rc::new(RefCell::new(Vec::<String>::new()));
+            let events_clone = events.clone();
+            let shared_clone = shared.clone();
+            let mut runner = OfflineRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    let shared = shared_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let events_a = events.clone();
+                        let shared_a = shared.clone();
+                        let a = ctx.branch_wait(
+                            move |c| {
+                                let events = events_a;
+                                let shared = shared_a;
+                                async move {
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_start".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                    let _ = c.wait_sec(0.10).await;
+                                    shared.borrow_mut().push("A".to_string());
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_end".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let events_b = events.clone();
+                        let shared_b = shared.clone();
+                        let b = ctx.branch_wait(
+                            move |c| {
+                                let events = events_b;
+                                let shared = shared_b;
+                                async move {
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B_start".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                    let _ = c.wait_sec(0.10).await;
+                                    shared.borrow_mut().push("B".to_string());
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B_end".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let _ = a.await;
+                        let _ = b.await;
+                        let _ = ctx.wait(0.0).await;
+
+                        let order = shared.borrow().join("");
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "joined".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: Some(order),
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    ..Default::default()
+                },
+            );
+            runner.step_sec(0.3);
+            let v = events.borrow().clone();
+            let s = shared.borrow().join("");
+            (v, s)
+        };
+
+        clear_all_barriers();
+
+        // Run realtime
+        let (realtime_events, realtime_shared) = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let shared = Rc::new(RefCell::new(Vec::<String>::new()));
+            let events_clone = events.clone();
+            let shared_clone = shared.clone();
+            let mut runner = RealtimeRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    let shared = shared_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let events_a = events.clone();
+                        let shared_a = shared.clone();
+                        let a = ctx.branch_wait(
+                            move |c| {
+                                let events = events_a;
+                                let shared = shared_a;
+                                async move {
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_start".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                    let _ = c.wait_sec(0.10).await;
+                                    shared.borrow_mut().push("A".to_string());
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_end".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let events_b = events.clone();
+                        let shared_b = shared.clone();
+                        let b = ctx.branch_wait(
+                            move |c| {
+                                let events = events_b;
+                                let shared = shared_b;
+                                async move {
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B_start".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                    let _ = c.wait_sec(0.10).await;
+                                    shared.borrow_mut().push("B".to_string());
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B_end".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let _ = a.await;
+                        let _ = b.await;
+                        let _ = ctx.wait(0.0).await;
+
+                        let order = shared.borrow().join("");
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "joined".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: Some(order),
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    rate: REALTIME_RATE,
+                    ..Default::default()
+                },
+            );
+            runner.run_until_complete();
+            let v = events.borrow().clone();
+            let s = shared.borrow().join("");
+            (v, s)
+        };
+
+        // Both modes should produce "AB" (A scheduled first)
+        assert_eq!(offline_shared, "AB", "Offline should produce AB ordering");
+        assert_eq!(realtime_shared, "AB", "Realtime should produce AB ordering");
+
+        compare_deterministic_runs(
+            test_name,
+            &offline_events,
+            &realtime_events,
+            &TestTolerances::default(),
+        );
+    }
+
+    /// Test: dual_mode_microtask_yield
+    /// Verifies proper interleaving of waits in both modes
+    #[test]
+    fn test_dual_mode_microtask_yield() {
+        clear_all_barriers();
+
+        let test_name = "dual_mode_microtask_yield";
+
+        // Run offline
+        let offline_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = OfflineRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        let events_a = events.clone();
+                        let a = ctx.branch_wait(
+                            move |c| {
+                                let events = events_a;
+                                async move {
+                                    let _ = c.wait_sec(0.10).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A@0.10".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                    let _ = c.wait_sec(0.05).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A@0.15".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let events_b = events.clone();
+                        let b = ctx.branch_wait(
+                            move |c| {
+                                let events = events_b;
+                                async move {
+                                    let _ = c.wait_sec(0.12).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B@0.12".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let _ = a.await;
+                        let _ = b.await;
+                        let _ = ctx.wait(0.0).await;
+
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "done".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    ..Default::default()
+                },
+            );
+            runner.step_sec(0.5);
+            { let v = events.borrow().clone(); v }
+        };
+
+        clear_all_barriers();
+
+        // Run realtime
+        let realtime_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = RealtimeRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        let events_a = events.clone();
+                        let a = ctx.branch_wait(
+                            move |c| {
+                                let events = events_a;
+                                async move {
+                                    let _ = c.wait_sec(0.10).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A@0.10".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                    let _ = c.wait_sec(0.05).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A@0.15".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let events_b = events.clone();
+                        let b = ctx.branch_wait(
+                            move |c| {
+                                let events = events_b;
+                                async move {
+                                    let _ = c.wait_sec(0.12).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B@0.12".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let _ = a.await;
+                        let _ = b.await;
+                        let _ = ctx.wait(0.0).await;
+
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "done".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    rate: REALTIME_RATE,
+                    ..Default::default()
+                },
+            );
+            runner.run_until_complete();
+            { let v = events.borrow().clone(); v }
+        };
+
+        compare_deterministic_runs(
+            test_name,
+            &offline_events,
+            &realtime_events,
+            &TestTolerances::default(),
+        );
+    }
+
+    /// Test: dual_mode_beat_wait
+    /// Verifies that beat-based waits work identically in both modes
+    #[test]
+    fn test_dual_mode_beat_wait() {
+        clear_all_barriers();
+
+        let test_name = "dual_mode_beat_wait";
+
+        // Run offline
+        let offline_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = OfflineRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        // At 120 BPM, 2 beats = 1 second
+                        let _ = ctx.wait(2.0).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "after_2_beats".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let _ = ctx.wait(2.0).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "after_4_beats".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 120.0,
+                    seed: test_name.to_string(),
+                    ..Default::default()
+                },
+            );
+            runner.step_sec(3.0);
+            { let v = events.borrow().clone(); v }
+        };
+
+        clear_all_barriers();
+
+        // Run realtime
+        let realtime_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = RealtimeRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        // At 120 BPM, 2 beats = 1 second
+                        let _ = ctx.wait(2.0).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "after_2_beats".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let _ = ctx.wait(2.0).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "after_4_beats".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 120.0,
+                    seed: test_name.to_string(),
+                    rate: REALTIME_RATE,
+                    ..Default::default()
+                },
+            );
+            runner.run_until_complete();
+            { let v = events.borrow().clone(); v }
+        };
+
+        compare_deterministic_runs(
+            test_name,
+            &offline_events,
+            &realtime_events,
+            &TestTolerances::default(),
+        );
+    }
+
+    /// Test: dual_mode_tempo_change_retimes
+    /// Verifies that tempo changes work identically in both modes
+    #[test]
+    fn test_dual_mode_tempo_change_retimes() {
+        clear_all_barriers();
+
+        let test_name = "dual_mode_tempo_change_retimes";
+
+        // Run offline
+        let offline_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = OfflineRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        // Branch to change tempo at t=0.50
+                        let ctx_clone = ctx.clone();
+                        let events_ctl = events.clone();
+                        ctx.branch(
+                            move |ctl| {
+                                let ctx = ctx_clone;
+                                let events = events_ctl;
+                                async move {
+                                    let _ = ctl.wait_sec(0.50).await;
+                                    ctx.set_bpm(480.0);
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "tempo_set_480@0.50".to_string(),
+                                        t: ctl.time(),
+                                        ctx_id: ctl.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        // Wait for 4 beats at 240 BPM
+                        // At 240 BPM: 4 beats/sec, so 4 beats = 1.0 sec at constant tempo
+                        // But tempo changes to 480 BPM at t=0.50
+                        let _ = ctx.wait(4.0).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "wait4beats_done".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 240.0,
+                    seed: test_name.to_string(),
+                    ..Default::default()
+                },
+            );
+            runner.step_sec(2.0);
+            { let v = events.borrow().clone(); v }
+        };
+
+        clear_all_barriers();
+
+        // Run realtime
+        let realtime_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = RealtimeRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        // Branch to change tempo at t=0.50
+                        let ctx_clone = ctx.clone();
+                        let events_ctl = events.clone();
+                        ctx.branch(
+                            move |ctl| {
+                                let ctx = ctx_clone;
+                                let events = events_ctl;
+                                async move {
+                                    let _ = ctl.wait_sec(0.50).await;
+                                    ctx.set_bpm(480.0);
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "tempo_set_480@0.50".to_string(),
+                                        t: ctl.time(),
+                                        ctx_id: ctl.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let _ = ctx.wait(4.0).await;
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "wait4beats_done".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 240.0,
+                    seed: test_name.to_string(),
+                    rate: REALTIME_RATE,
+                    ..Default::default()
+                },
+            );
+            runner.run_until_complete();
+            { let v = events.borrow().clone(); v }
+        };
+
+        compare_deterministic_runs(
+            test_name,
+            &offline_events,
+            &realtime_events,
+            &TestTolerances::default(),
+        );
+    }
+
+    /// Test: dual_mode_rng_forked
+    /// Verifies that forked RNG produces identical values in both modes
+    #[test]
+    fn test_dual_mode_rng_forked() {
+        clear_all_barriers();
+
+        let test_name = "dual_mode_rng_forked";
+
+        // Run offline
+        let offline_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = OfflineRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let events_a = events.clone();
+                        let a = ctx.branch_wait(
+                            move |c| {
+                                let events = events_a;
+                                async move {
+                                    let _ = c.wait_sec(0.05).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_r0".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: Some(c.random()),
+                                    });
+                                    let _ = c.wait_sec(0.05).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_r1".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: Some(c.random()),
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let events_b = events.clone();
+                        let b = ctx.branch_wait(
+                            move |c| {
+                                let events = events_b;
+                                async move {
+                                    let _ = c.wait_sec(0.10).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B_r0".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: Some(c.random()),
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let _ = a.await;
+                        let _ = b.await;
+                        let _ = ctx.wait(0.0).await;
+
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "joined".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    ..Default::default()
+                },
+            );
+            runner.step_sec(0.5);
+            { let v = events.borrow().clone(); v }
+        };
+
+        clear_all_barriers();
+
+        // Run realtime
+        let realtime_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = RealtimeRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let events_a = events.clone();
+                        let a = ctx.branch_wait(
+                            move |c| {
+                                let events = events_a;
+                                async move {
+                                    let _ = c.wait_sec(0.05).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_r0".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: Some(c.random()),
+                                    });
+                                    let _ = c.wait_sec(0.05).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_r1".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: Some(c.random()),
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let events_b = events.clone();
+                        let b = ctx.branch_wait(
+                            move |c| {
+                                let events = events_b;
+                                async move {
+                                    let _ = c.wait_sec(0.10).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B_r0".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: Some(c.random()),
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let _ = a.await;
+                        let _ = b.await;
+                        let _ = ctx.wait(0.0).await;
+
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "joined".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    rate: REALTIME_RATE,
+                    ..Default::default()
+                },
+            );
+            runner.run_until_complete();
+            { let v = events.borrow().clone(); v }
+        };
+
+        compare_deterministic_runs(
+            test_name,
+            &offline_events,
+            &realtime_events,
+            &TestTolerances::default(),
+        );
+    }
+
+    /// Test: dual_mode_rng_shared
+    /// Verifies that shared RNG produces identical values in both modes
+    #[test]
+    fn test_dual_mode_rng_shared() {
+        clear_all_barriers();
+
+        let test_name = "dual_mode_rng_shared";
+
+        // Run offline
+        let offline_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = OfflineRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let events_a = events.clone();
+                        let a = ctx.branch_wait(
+                            move |c| {
+                                let events = events_a;
+                                async move {
+                                    let _ = c.wait_sec(0.05).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_draw".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: Some(c.random()),
+                                    });
+                                }
+                            },
+                            BranchOptions {
+                                rng: RngMode::Shared,
+                                ..Default::default()
+                            },
+                        );
+
+                        let events_b = events.clone();
+                        let b = ctx.branch_wait(
+                            move |c| {
+                                let events = events_b;
+                                async move {
+                                    let _ = c.wait_sec(0.05).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B_draw".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: Some(c.random()),
+                                    });
+                                }
+                            },
+                            BranchOptions {
+                                rng: RngMode::Shared,
+                                ..Default::default()
+                            },
+                        );
+
+                        let _ = a.await;
+                        let _ = b.await;
+                        let _ = ctx.wait(0.0).await;
+
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "joined".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    ..Default::default()
+                },
+            );
+            runner.step_sec(0.5);
+            { let v = events.borrow().clone(); v }
+        };
+
+        clear_all_barriers();
+
+        // Run realtime
+        let realtime_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = RealtimeRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let events_a = events.clone();
+                        let a = ctx.branch_wait(
+                            move |c| {
+                                let events = events_a;
+                                async move {
+                                    let _ = c.wait_sec(0.05).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "A_draw".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: Some(c.random()),
+                                    });
+                                }
+                            },
+                            BranchOptions {
+                                rng: RngMode::Shared,
+                                ..Default::default()
+                            },
+                        );
+
+                        let events_b = events.clone();
+                        let b = ctx.branch_wait(
+                            move |c| {
+                                let events = events_b;
+                                async move {
+                                    let _ = c.wait_sec(0.05).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "B_draw".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: Some(c.random()),
+                                    });
+                                }
+                            },
+                            BranchOptions {
+                                rng: RngMode::Shared,
+                                ..Default::default()
+                            },
+                        );
+
+                        let _ = a.await;
+                        let _ = b.await;
+                        let _ = ctx.wait(0.0).await;
+
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "joined".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    rate: REALTIME_RATE,
+                    ..Default::default()
+                },
+            );
+            runner.run_until_complete();
+            { let v = events.borrow().clone(); v }
+        };
+
+        compare_deterministic_runs(
+            test_name,
+            &offline_events,
+            &realtime_events,
+            &TestTolerances::default(),
+        );
+    }
+
+    /// Test: dual_mode_barrier_sync
+    /// Verifies that barrier synchronization works identically in both modes
+    #[test]
+    fn test_dual_mode_barrier_sync() {
+        clear_all_barriers();
+
+        let test_name = "dual_mode_barrier_sync";
+        let barrier_key = "dual_mode_barrier_sync_key";
+
+        // Run offline
+        let offline_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = OfflineRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        // Producer
+                        let events_b = events.clone();
+                        ctx.branch(
+                            move |b| {
+                                let events = events_b;
+                                async move {
+                                    for cycle in 0..2 {
+                                        start_barrier(barrier_key, &b);
+                                        events.borrow_mut().push(LoggedEvent {
+                                            id: format!("B_start_{}", cycle),
+                                            t: b.time(),
+                                            ctx_id: b.id(),
+                                            note: None,
+                                            value: None,
+                                        });
+                                        let _ = b.wait_sec(0.20).await;
+                                        events.borrow_mut().push(LoggedEvent {
+                                            id: format!("B_end_{}", cycle),
+                                            t: b.time(),
+                                            ctx_id: b.id(),
+                                            note: None,
+                                            value: None,
+                                        });
+                                        resolve_barrier(barrier_key, &b);
+                                    }
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        // Consumer
+                        let events_a = events.clone();
+                        let _ = ctx
+                            .branch_wait(
+                                move |a| {
+                                    let events = events_a;
+                                    async move {
+                                        for cycle in 0..2 {
+                                            events.borrow_mut().push(LoggedEvent {
+                                                id: format!("A_start_{}", cycle),
+                                                t: a.time(),
+                                                ctx_id: a.id(),
+                                                note: None,
+                                                value: None,
+                                            });
+                                            let _ = a.wait_sec(0.15).await;
+                                            events.borrow_mut().push(LoggedEvent {
+                                                id: format!("A_end_{}", cycle),
+                                                t: a.time(),
+                                                ctx_id: a.id(),
+                                                note: None,
+                                                value: None,
+                                            });
+                                            let _ = await_barrier(barrier_key, &a).await;
+                                            events.borrow_mut().push(LoggedEvent {
+                                                id: format!("A_synced_{}", cycle),
+                                                t: a.time(),
+                                                ctx_id: a.id(),
+                                                note: None,
+                                                value: None,
+                                            });
+                                        }
+                                    }
+                                },
+                                BranchOptions::default(),
+                            )
+                            .await;
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    ..Default::default()
+                },
+            );
+            runner.step_sec(1.0);
+            { let v = events.borrow().clone(); v }
+        };
+
+        clear_all_barriers();
+
+        // Run realtime
+        let realtime_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = RealtimeRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        // Producer
+                        let events_b = events.clone();
+                        ctx.branch(
+                            move |b| {
+                                let events = events_b;
+                                async move {
+                                    for cycle in 0..2 {
+                                        start_barrier(barrier_key, &b);
+                                        events.borrow_mut().push(LoggedEvent {
+                                            id: format!("B_start_{}", cycle),
+                                            t: b.time(),
+                                            ctx_id: b.id(),
+                                            note: None,
+                                            value: None,
+                                        });
+                                        let _ = b.wait_sec(0.20).await;
+                                        events.borrow_mut().push(LoggedEvent {
+                                            id: format!("B_end_{}", cycle),
+                                            t: b.time(),
+                                            ctx_id: b.id(),
+                                            note: None,
+                                            value: None,
+                                        });
+                                        resolve_barrier(barrier_key, &b);
+                                    }
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        // Consumer
+                        let events_a = events.clone();
+                        let _ = ctx
+                            .branch_wait(
+                                move |a| {
+                                    let events = events_a;
+                                    async move {
+                                        for cycle in 0..2 {
+                                            events.borrow_mut().push(LoggedEvent {
+                                                id: format!("A_start_{}", cycle),
+                                                t: a.time(),
+                                                ctx_id: a.id(),
+                                                note: None,
+                                                value: None,
+                                            });
+                                            let _ = a.wait_sec(0.15).await;
+                                            events.borrow_mut().push(LoggedEvent {
+                                                id: format!("A_end_{}", cycle),
+                                                t: a.time(),
+                                                ctx_id: a.id(),
+                                                note: None,
+                                                value: None,
+                                            });
+                                            let _ = await_barrier(barrier_key, &a).await;
+                                            events.borrow_mut().push(LoggedEvent {
+                                                id: format!("A_synced_{}", cycle),
+                                                t: a.time(),
+                                                ctx_id: a.id(),
+                                                note: None,
+                                                value: None,
+                                            });
+                                        }
+                                    }
+                                },
+                                BranchOptions::default(),
+                            )
+                            .await;
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    rate: REALTIME_RATE,
+                    ..Default::default()
+                },
+            );
+            runner.run_until_complete();
+            { let v = events.borrow().clone(); v }
+        };
+
+        compare_deterministic_runs(
+            test_name,
+            &offline_events,
+            &realtime_events,
+            &TestTolerances::default(),
+        );
+    }
+
+    /// Test: dual_mode_many_branches_stress
+    /// Stress test with many parallel branches in both modes
+    #[test]
+    fn test_dual_mode_many_branches_stress() {
+        clear_all_barriers();
+
+        let test_name = "dual_mode_many_branches_stress";
+
+        // Run offline
+        let offline_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = OfflineRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let mut handles = Vec::new();
+
+                        for i in 0..10 {
+                            let d = 0.02 * (i as f64 + 1.0);
+                            let events_i = events.clone();
+                            let task_name = format!("task{}", i);
+
+                            let handle = ctx.branch_wait(
+                                move |c| {
+                                    let events = events_i;
+                                    let name = task_name;
+                                    async move {
+                                        events.borrow_mut().push(LoggedEvent {
+                                            id: format!("{}_start", name),
+                                            t: c.time(),
+                                            ctx_id: c.id(),
+                                            note: None,
+                                            value: None,
+                                        });
+                                        let _ = c.wait_sec(d).await;
+                                        events.borrow_mut().push(LoggedEvent {
+                                            id: format!("{}_end", name),
+                                            t: c.time(),
+                                            ctx_id: c.id(),
+                                            note: None,
+                                            value: None,
+                                        });
+                                    }
+                                },
+                                BranchOptions::default(),
+                            );
+                            handles.push(handle);
+                        }
+
+                        for h in handles {
+                            let _ = h.await;
+                        }
+                        let _ = ctx.wait(0.0).await;
+
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "joined".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    ..Default::default()
+                },
+            );
+            runner.step_sec(0.5);
+            { let v = events.borrow().clone(); v }
+        };
+
+        clear_all_barriers();
+
+        // Run realtime
+        let realtime_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = RealtimeRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "start".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let mut handles = Vec::new();
+
+                        for i in 0..10 {
+                            let d = 0.02 * (i as f64 + 1.0);
+                            let events_i = events.clone();
+                            let task_name = format!("task{}", i);
+
+                            let handle = ctx.branch_wait(
+                                move |c| {
+                                    let events = events_i;
+                                    let name = task_name;
+                                    async move {
+                                        events.borrow_mut().push(LoggedEvent {
+                                            id: format!("{}_start", name),
+                                            t: c.time(),
+                                            ctx_id: c.id(),
+                                            note: None,
+                                            value: None,
+                                        });
+                                        let _ = c.wait_sec(d).await;
+                                        events.borrow_mut().push(LoggedEvent {
+                                            id: format!("{}_end", name),
+                                            t: c.time(),
+                                            ctx_id: c.id(),
+                                            note: None,
+                                            value: None,
+                                        });
+                                    }
+                                },
+                                BranchOptions::default(),
+                            );
+                            handles.push(handle);
+                        }
+
+                        for h in handles {
+                            let _ = h.await;
+                        }
+                        let _ = ctx.wait(0.0).await;
+
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "joined".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    rate: REALTIME_RATE,
+                    ..Default::default()
+                },
+            );
+            runner.run_until_complete();
+            { let v = events.borrow().clone(); v }
+        };
+
+        compare_deterministic_runs(
+            test_name,
+            &offline_events,
+            &realtime_events,
+            &TestTolerances::default(),
+        );
+    }
+
+    /// Test: dual_mode_wait0_sync
+    /// Verifies that wait(0) works as a sync point in both modes
+    #[test]
+    fn test_dual_mode_wait0_sync() {
+        clear_all_barriers();
+
+        let test_name = "dual_mode_wait0_sync";
+
+        // Run offline
+        let offline_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = OfflineRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        let events_p1 = events.clone();
+                        let p1 = ctx.branch_wait(
+                            move |c| {
+                                let events = events_p1;
+                                async move {
+                                    let _ = c.wait_sec(0.10).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "p1_done".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let events_p2 = events.clone();
+                        let p2 = ctx.branch_wait(
+                            move |c| {
+                                let events = events_p2;
+                                async move {
+                                    let _ = c.wait_sec(0.20).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "p2_done".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let _ = p1.await;
+                        let _ = p2.await;
+
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "after_all_immediate".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let _ = ctx.wait(0.0).await;
+
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "after_all_after_wait0".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    ..Default::default()
+                },
+            );
+            runner.step_sec(1.0);
+            { let v = events.borrow().clone(); v }
+        };
+
+        clear_all_barriers();
+
+        // Run realtime
+        let realtime_events = {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let events_clone = events.clone();
+            let mut runner = RealtimeRunner::new(
+                move |ctx| {
+                    let events = events_clone.clone();
+                    async move {
+                        let events_p1 = events.clone();
+                        let p1 = ctx.branch_wait(
+                            move |c| {
+                                let events = events_p1;
+                                async move {
+                                    let _ = c.wait_sec(0.10).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "p1_done".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let events_p2 = events.clone();
+                        let p2 = ctx.branch_wait(
+                            move |c| {
+                                let events = events_p2;
+                                async move {
+                                    let _ = c.wait_sec(0.20).await;
+                                    events.borrow_mut().push(LoggedEvent {
+                                        id: "p2_done".to_string(),
+                                        t: c.time(),
+                                        ctx_id: c.id(),
+                                        note: None,
+                                        value: None,
+                                    });
+                                }
+                            },
+                            BranchOptions::default(),
+                        );
+
+                        let _ = p1.await;
+                        let _ = p2.await;
+
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "after_all_immediate".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+
+                        let _ = ctx.wait(0.0).await;
+
+                        events.borrow_mut().push(LoggedEvent {
+                            id: "after_all_after_wait0".to_string(),
+                            t: ctx.time(),
+                            ctx_id: ctx.id(),
+                            note: None,
+                            value: None,
+                        });
+                    }
+                },
+                EngineConfig {
+                    bpm: 60.0,
+                    seed: test_name.to_string(),
+                    rate: REALTIME_RATE,
+                    ..Default::default()
+                },
+            );
+            runner.run_until_complete();
+            { let v = events.borrow().clone(); v }
+        };
+
+        compare_deterministic_runs(
+            test_name,
+            &offline_events,
+            &realtime_events,
+            &TestTolerances::default(),
+        );
+    }
+
+    /// Test: realtime_basic_wait
+    /// Basic realtime test without comparison (standalone validation)
+    #[test]
+    fn test_realtime_basic_wait() {
+        clear_all_barriers();
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let mut runner = RealtimeRunner::new(
+            move |ctx| {
+                let events = events_clone.clone();
+                async move {
+                    events.borrow_mut().push(LoggedEvent {
+                        id: "start".to_string(),
+                        t: ctx.time(),
+                        ctx_id: ctx.id(),
+                        note: None,
+                        value: None,
+                    });
+                    let _ = ctx.wait_sec(0.05).await;
+                    events.borrow_mut().push(LoggedEvent {
+                        id: "mid".to_string(),
+                        t: ctx.time(),
+                        ctx_id: ctx.id(),
+                        note: None,
+                        value: None,
+                    });
+                    let _ = ctx.wait_sec(0.05).await;
+                    events.borrow_mut().push(LoggedEvent {
+                        id: "end".to_string(),
+                        t: ctx.time(),
+                        ctx_id: ctx.id(),
+                        note: None,
+                        value: None,
+                    });
+                }
+            },
+            EngineConfig {
+                bpm: 60.0,
+                seed: "realtime_basic_wait".to_string(),
+                rate: REALTIME_RATE,
+                ..Default::default()
+            },
+        );
+
+        runner.run_until_complete();
+
+        let events = events.borrow();
+        assert_events_match(&events, &["start", "mid", "end"], "realtime_basic_wait");
+        assert_time_approx(&events, 0, 0.0, 1e-6, "realtime_basic_wait");
+        assert_time_approx(&events, 1, 0.05, 1e-6, "realtime_basic_wait");
+        assert_time_approx(&events, 2, 0.10, 1e-6, "realtime_basic_wait");
+    }
+
+    /// Test: realtime_beat_wait_basic
+    /// Basic realtime beat wait test
+    #[test]
+    fn test_realtime_beat_wait_basic() {
+        clear_all_barriers();
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let mut runner = RealtimeRunner::new(
+            move |ctx| {
+                let events = events_clone.clone();
+                async move {
+                    events.borrow_mut().push(LoggedEvent {
+                        id: "start".to_string(),
+                        t: ctx.time(),
+                        ctx_id: ctx.id(),
+                        note: None,
+                        value: None,
+                    });
+                    // At 120 BPM, 2 beats = 1 second
+                    let _ = ctx.wait(2.0).await;
+                    events.borrow_mut().push(LoggedEvent {
+                        id: "after_2_beats".to_string(),
+                        t: ctx.time(),
+                        ctx_id: ctx.id(),
+                        note: None,
+                        value: None,
+                    });
+                }
+            },
+            EngineConfig {
+                bpm: 120.0,
+                seed: "realtime_beat_wait_basic".to_string(),
+                rate: REALTIME_RATE,
+                ..Default::default()
+            },
+        );
+
+        runner.run_until_complete();
+
+        let events = events.borrow();
+        assert_events_match(&events, &["start", "after_2_beats"], "realtime_beat_wait_basic");
+        assert_time_approx(&events, 0, 0.0, 1e-6, "realtime_beat_wait_basic");
+        assert_time_approx(&events, 1, 1.0, 1e-6, "realtime_beat_wait_basic"); // 2 beats at 120 BPM = 1 sec
+    }
+
+    /// Test: realtime_branch_parallel
+    /// Test parallel branches in realtime mode
+    #[test]
+    fn test_realtime_branch_parallel() {
+        clear_all_barriers();
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let mut runner = RealtimeRunner::new(
+            move |ctx| {
+                let events = events_clone.clone();
+                async move {
+                    events.borrow_mut().push(LoggedEvent {
+                        id: "start".to_string(),
+                        t: ctx.time(),
+                        ctx_id: ctx.id(),
+                        note: None,
+                        value: None,
+                    });
+
+                    let events_a = events.clone();
+                    let a = ctx.branch_wait(
+                        move |c| {
+                            let events = events_a;
+                            async move {
+                                let _ = c.wait_sec(0.10).await;
+                                events.borrow_mut().push(LoggedEvent {
+                                    id: "A_done".to_string(),
+                                    t: c.time(),
+                                    ctx_id: c.id(),
+                                    note: None,
+                                    value: None,
+                                });
+                            }
+                        },
+                        BranchOptions::default(),
+                    );
+
+                    let events_b = events.clone();
+                    let b = ctx.branch_wait(
+                        move |c| {
+                            let events = events_b;
+                            async move {
+                                let _ = c.wait_sec(0.05).await;
+                                events.borrow_mut().push(LoggedEvent {
+                                    id: "B_done".to_string(),
+                                    t: c.time(),
+                                    ctx_id: c.id(),
+                                    note: None,
+                                    value: None,
+                                });
+                            }
+                        },
+                        BranchOptions::default(),
+                    );
+
+                    let _ = a.await;
+                    let _ = b.await;
+                    let _ = ctx.wait(0.0).await;
+
+                    events.borrow_mut().push(LoggedEvent {
+                        id: "joined".to_string(),
+                        t: ctx.time(),
+                        ctx_id: ctx.id(),
+                        note: None,
+                        value: None,
+                    });
+                }
+            },
+            EngineConfig {
+                bpm: 60.0,
+                seed: "realtime_branch_parallel".to_string(),
+                rate: REALTIME_RATE,
+                ..Default::default()
+            },
+        );
+
+        runner.run_until_complete();
+
+        let events = events.borrow();
+
+        // B finishes before A (0.05 < 0.10)
+        let b_idx = events.iter().position(|e| e.id == "B_done").unwrap();
+        let a_idx = events.iter().position(|e| e.id == "A_done").unwrap();
+        assert!(b_idx < a_idx, "B_done should come before A_done");
+
+        // Check joined is last
+        assert_eq!(events.last().unwrap().id, "joined");
     }
 }
