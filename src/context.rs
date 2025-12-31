@@ -60,6 +60,10 @@ pub enum RngMode {
     Shared,
 }
 
+/// A cancel handler that can be called when the context is canceled.
+/// Uses Option to allow FnOnce to be stored as FnMut.
+type CancelHandler = Box<dyn FnMut()>;
+
 /// Inner state of a context (behind Rc<RefCell<>>).
 pub struct CtxInner {
     pub id: u64,
@@ -93,6 +97,29 @@ pub struct CtxInner {
     pub rng: Rc<RefCell<DetRng>>,
     pub rng_seed: String,
     pub rng_fork_counter: u64,
+
+    /// Cancel handlers registered via handle_cancel().
+    /// Called when cancel() is invoked on this context.
+    cancel_handlers: HashMap<u64, CancelHandler>,
+    /// Counter for generating unique cancel handler IDs.
+    cancel_handler_counter: u64,
+}
+
+/// Handle for unsubscribing a cancel handler.
+/// Call `unsubscribe()` to remove the handler, or drop to let it remain registered.
+pub struct CancelHandlerUnsubscribe {
+    ctx: Option<Ctx>,
+    handler_id: u64,
+}
+
+impl CancelHandlerUnsubscribe {
+    /// Remove the cancel handler. After calling this, the handler will not be invoked
+    /// even if the context is canceled.
+    pub fn unsubscribe(self) {
+        if let Some(ctx) = &self.ctx {
+            ctx.0.borrow_mut().cancel_handlers.remove(&self.handler_id);
+        }
+    }
 }
 
 /// A handle to a time context.
@@ -125,6 +152,8 @@ impl Ctx {
             rng: Rc::new(RefCell::new(DetRng::new(seed))),
             rng_seed: seed.to_string(),
             rng_fork_counter: 0,
+            cancel_handlers: HashMap::new(),
+            cancel_handler_counter: 0,
         }));
 
         // Set root to itself
@@ -221,8 +250,9 @@ impl Ctx {
     }
 
     /// Cancel this context and all children.
+    /// Also invokes all registered cancel handlers.
     pub fn cancel(&self) {
-        let (waiters, children, scheduler) = {
+        let (waiters, children, scheduler, cancel_handlers) = {
             let mut inner = self.0.borrow_mut();
             if inner.canceled {
                 return;
@@ -237,7 +267,11 @@ impl Ctx {
             inner.pending_waiters.clear();
 
             let children = inner.children.clone();
-            (waiters, children, inner.scheduler.clone())
+
+            // Take cancel handlers - drain the map so handlers can't be called twice
+            let handlers: Vec<CancelHandler> = inner.cancel_handlers.drain().map(|(_, h)| h).collect();
+
+            (waiters, children, inner.scheduler.clone(), handlers)
         };
 
         // Cancel waiters in scheduler
@@ -248,11 +282,61 @@ impl Ctx {
             }
         }
 
+        // Invoke cancel handlers (outside the borrow)
+        for mut handler in cancel_handlers {
+            handler();
+        }
+
         // Cascade to children
         for child_weak in children {
             if let Some(child_rc) = child_weak.upgrade() {
                 Ctx(child_rc).cancel();
             }
+        }
+    }
+
+    /// Register a handler that runs when this context is canceled.
+    /// Returns an unsubscribe function. If already canceled, the handler fires immediately.
+    ///
+    /// This is the Rust equivalent of the TypeScript `handleCancel` API.
+    /// Use this instead of relying on Drop behavior to ensure cancel cleanup
+    /// happens deterministically when cancel() is called.
+    pub fn handle_cancel<F>(&self, on_cancel: F) -> CancelHandlerUnsubscribe
+    where
+        F: FnOnce() + 'static,
+    {
+        // Wrap FnOnce in Option so we can store it as FnMut
+        let mut opt = Some(on_cancel);
+        let handler: CancelHandler = Box::new(move || {
+            if let Some(f) = opt.take() {
+                f();
+            }
+        });
+
+        // Check if already canceled - if so, call immediately
+        let already_canceled = self.0.borrow().canceled;
+        if already_canceled {
+            // Call the handler directly, wrapped in a mutable binding
+            let mut handler = handler;
+            handler();
+            return CancelHandlerUnsubscribe {
+                ctx: None,
+                handler_id: 0,
+            };
+        }
+
+        // Register the handler
+        let handler_id = {
+            let mut inner = self.0.borrow_mut();
+            let id = inner.cancel_handler_counter;
+            inner.cancel_handler_counter += 1;
+            inner.cancel_handlers.insert(id, handler);
+            id
+        };
+
+        CancelHandlerUnsubscribe {
+            ctx: Some(self.clone()),
+            handler_id,
         }
     }
 
@@ -363,6 +447,8 @@ impl Ctx {
             rng,
             rng_seed,
             rng_fork_counter: 0,
+            cancel_handlers: HashMap::new(),
+            cancel_handler_counter: 0,
         }));
 
         // Add to parent's children
@@ -500,6 +586,31 @@ impl BranchHandle {
     /// Get the future to spawn on the executor.
     pub fn take_future(&mut self) -> Option<Pin<Box<dyn Future<Output = ()>>>> {
         self.future.take()
+    }
+
+    /// Register a handler that runs when this branch is canceled.
+    /// Returns an unsubscribe handle. If already canceled, the handler fires immediately.
+    ///
+    /// This is equivalent to the TypeScript `handleCancel` API.
+    /// Use this for cleanup that must happen when a branch is canceled,
+    /// for example turning off a note that was playing.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let note_handle = ctx.branch(|c| async move {
+    ///     play_note(60);
+    ///     c.wait_sec(1.0).await;
+    /// }, BranchOptions::default());
+    ///
+    /// note_handle.handle_cancel(|| {
+    ///     stop_note(60); // Guaranteed to run if branch is canceled
+    /// });
+    /// ```
+    pub fn handle_cancel<F>(&self, on_cancel: F) -> CancelHandlerUnsubscribe
+    where
+        F: FnOnce() + 'static,
+    {
+        self.ctx.handle_cancel(on_cancel)
     }
 }
 

@@ -759,8 +759,83 @@ mod tests {
         }
     }
 
-    // Test 13: noteoff_finally_guaranteed_on_cancel
-    // NOTE: Skipped - requires `finally` API not yet implemented. See todos.md
+    // Test 13: noteoff_handleCancel_guaranteed_on_cancel
+    // Tests that handleCancel is called when a branch is canceled, even if the branch
+    // has already completed. This is crucial for "note off" cleanup in musical contexts.
+    dual_mode_test! {
+        name: test_noteoff_handle_cancel_guaranteed_on_cancel,
+        config: TestConfig::new("noteoff_handleCancel_guaranteed_on_cancel").with_duration(1.2),
+        scenario: |ctx: Ctx, events: EventLog| async move {
+            let log = make_logger(events.clone());
+
+            log(&ctx, "note1_on", None, None);
+
+            // Start note1 branch - will complete naturally at t=0.30
+            let events_note1 = events.clone();
+            let note1 = ctx.branch(
+                move |c| {
+                    let log = make_logger(events_note1);
+                    async move {
+                        let _ = c.wait_sec(0.30).await;
+                        log(&c, "note1_off_in_branch", None, None);
+                    }
+                },
+                BranchOptions::default(),
+            );
+
+            // Register handleCancel for note1 - this should fire when we cancel() later
+            let events_cancel1 = events.clone();
+            note1.handle_cancel({
+                let log = make_logger(events_cancel1);
+                let ctx_clone = ctx.clone();
+                move || {
+                    log(&ctx_clone, "note1_off_handleCancel", None, None);
+                }
+            });
+
+            let _ = ctx.wait_sec(0.05).await;
+            log(&ctx, "note2_on", None, None);
+
+            // Start note2 branch - will be canceled before completion
+            let events_note2 = events.clone();
+            let note2 = ctx.branch(
+                move |c| {
+                    let log = make_logger(events_note2);
+                    async move {
+                        let _ = c.wait_sec(0.30).await;
+                        log(&c, "note2_off_in_branch", None, None);
+                    }
+                },
+                BranchOptions::default(),
+            );
+
+            // Register handleCancel for note2
+            let events_cancel2 = events.clone();
+            note2.handle_cancel({
+                let log = make_logger(events_cancel2);
+                let ctx_clone = ctx.clone();
+                move || {
+                    log(&ctx_clone, "note2_off_handleCancel", None, None);
+                }
+            });
+
+            // At t=0.20, cancel note2 (before it completes at t=0.35)
+            let _ = ctx.wait_sec(0.15).await;
+            log(&ctx, "cancel_note2", None, None);
+            note2.cancel();
+
+            // At t=0.20 after cancel: handleCancel for note2 should have fired
+
+            // At t=0.40, cancel note1 (after it completed at t=0.30)
+            let _ = ctx.wait_sec(0.20).await;
+            log(&ctx, "cancel_note1", None, None);
+            note1.cancel();
+
+            // Continue to verify no issues
+            let _ = ctx.wait_sec(0.50).await;
+            log(&ctx, "done", None, None);
+        }
+    }
 
     // Test 14: waitSec_negative_and_NaN_are_safe
     dual_mode_test! {

@@ -29,7 +29,7 @@ import {
   type TimeContext,
   // If you exported RandomSeed, you can import it; otherwise keep local typing.
   // type RandomSeed,
-} from "./offline_time_context";
+} from "./offline_time_context.ts";
 
 /* ------------------------------------------------------------------------------------------------
  * Types
@@ -563,7 +563,7 @@ export function makeTimingTestCases(): TimingTestCase[] {
     },
 
     {
-      name: "noteoff_finally_guaranteed_on_cancel",
+      name: "noteoff_handleCancel_guaranteed_on_cancel",
       logicalDurationSec: 1.2,
       run: async (root, log) => {
         log(root, "note1_on");
@@ -571,7 +571,7 @@ export function makeTimingTestCases(): TimingTestCase[] {
           await c.waitSec(0.30);
           log(c, "note1_off_in_branch");
         }, "note1");
-        note1.finally(() => log(root, "note1_off_finally"));
+        note1.handleCancel(() => log(root, "note1_off_handleCancel"));
 
         await root.waitSec(0.05);
         log(root, "note2_on");
@@ -579,7 +579,7 @@ export function makeTimingTestCases(): TimingTestCase[] {
           await c.waitSec(0.30);
           log(c, "note2_off_in_branch");
         }, "note2");
-        note2.finally(() => log(root, "note2_off_finally"));
+        note2.handleCancel(() => log(root, "note2_off_handleCancel"));
 
         await root.waitSec(0.15);
         log(root, "cancel_note2");
@@ -727,3 +727,15 @@ export async function runAllTimingTests(
 
   return results;
 }
+
+export async function runTimingTestsGuarded() {
+  console.log('Running timing tests...')
+  try {
+    await runAllTimingTests()
+  } catch (err) {
+    console.error(err)
+  }
+  console.log('Timing tests completed')
+}
+
+runTimingTestsGuarded()

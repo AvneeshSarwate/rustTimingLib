@@ -44,6 +44,24 @@
  *    - OfflineRunner can step time or frames and run the same timed code without wall-clock delays.
  *
  *
+ * Environment Differences
+ * -----------------------
+ * Observed: the cancellation test "noteoff_handleCancel_guaranteed_on_cancel"
+ * behaves differently in Chrome vs Deno if .finally() is used instead of handleCancel():
+ * it passes in Chrome but fails in Deno due to how cancellations surface.
+ *
+ * Known / intentional runtime behavior: Promise.finally creates a new promise that
+ * rejects when the task is canceled. Browsers typically only log unhandled rejections,
+ * while server runtimes (Deno, Node, Bun) often treat them as fatal by default.
+ * So the difference is policy, not a bug in the engine.
+ *
+ * Fix: avoid Promise.finally for cancel-only cleanup. Use handleCancel(...)
+ * on the returned task handle (or attach a .catch to the finally promise) to prevent
+ * unhandled rejections and keep cancellation cleanup deterministic.
+ * 
+ * This difference can be seen running finally_test.ts in different environemnts.
+ *
+ *
  * Capabilities / Public API Summary
  * --------------------------------
  * - launch(fn): create a root DateTimeContext in realtime (setTimeout-only, works everywhere).
@@ -125,7 +143,7 @@
  * - Creates a new child context whose initial time is root.mostRecentDescendentTime (align to global).
  * - Runs fn(childCtx) concurrently.
  * - Does NOT update parentCtx.time when the branch finishes.
- * - Returns a handle with cancel() and finally().
+ * - Returns a handle with cancel(), finally(), and handleCancel().
  *
  * branchWait(fn):
  * - Creates a new child context whose initial time is parentCtx.time.
@@ -297,7 +315,7 @@
 
 
 
-import { PriorityQueue } from "./priorityQueue";
+import { PriorityQueue } from "./priorityQueue.ts";
 import seedrandom from "seedrandom";
 
 export type RandomSeed = string | number;
@@ -397,6 +415,32 @@ export class CancelablePromiseProxy<T> implements Promise<T> {
   public cancel() {
     this.abortController.abort();
     this.timeContext?.cancel();
+  }
+
+  /**
+   * Register a handler that runs when this task is canceled (AbortController aborts).
+   * Returns an unsubscribe function. If already canceled, the handler fires immediately.
+   */
+  public handleCancel(onCancel?: (() => void) | undefined | null): () => void {
+    if (!onCancel) return () => {};
+
+    const signal = this.abortController.signal;
+    let called = false;
+
+    const wrapped = () => {
+      if (called) return;
+      called = true;
+      signal.removeEventListener("abort", wrapped);
+      onCancel();
+    };
+
+    if (signal.aborted) {
+      wrapped();
+      return () => {};
+    }
+
+    signal.addEventListener("abort", wrapped);
+    return () => signal.removeEventListener("abort", wrapped);
   }
 
   [Symbol.toStringTag] = "[object CancelablePromiseProxy]";
@@ -1364,6 +1408,19 @@ export function awaitBarrier(key: string, ctx: TimeContext): Promise<void> {
 /* ---------------------------------------------------------------------------------------------- */
 
 let contextId = 0;
+const rootContexts: Set<TimeContext> = new Set();
+
+export function cancelAllContexts() {
+  const roots = Array.from(rootContexts);
+  for (const ctx of roots) {
+    try {
+      ctx.cancel();
+    } catch {
+      // best-effort cancel; ignore unexpected errors
+    }
+  }
+  rootContexts.clear();
+}
 
 export type BranchOptions = {
   tempo?: "shared" | "cloned"; // default shared
@@ -1391,7 +1448,7 @@ export abstract class TimeContext {
   // Scheduler + tempo are wired during launch/branch creation
   public scheduler!: TimeScheduler;
   public tempo!: TempoMap;
-  public rng!: seedrandom.PRNG;
+  public rng!: SeedrandomPRNG;
   public rngSeed!: string;
   private rngForkCounter = 0;
 
@@ -1477,7 +1534,11 @@ export abstract class TimeContext {
     this.childContexts.forEach((ctx) => ctx.cancel());
   }
 
-  public branch<T>(block: (ctx: TimeContext) => Promise<T>, debugName = "", opts?: BranchOptions): { cancel: () => void; finally: (f: () => void) => void } {
+  public branch<T>(
+    block: (ctx: TimeContext) => Promise<T>,
+    debugName = "",
+    opts?: BranchOptions,
+  ): { cancel: () => void; finally: (f: () => void) => void; handleCancel: (f: () => void) => () => void } {
     const promise = createAndLaunchContext(
       block,
       this.rootContext!.mostRecentDescendentTime,
@@ -1490,6 +1551,7 @@ export abstract class TimeContext {
     return {
       finally: (finalFunc: () => void) => promise.finally(finalFunc),
       cancel: () => promise.cancel(),
+      handleCancel: (cancelFunc: () => void) => promise.handleCancel(cancelFunc),
     };
   }
 
@@ -1607,6 +1669,13 @@ export function createAndLaunchContext<T, C extends TimeContext>(
     const err = e as Error;
     console.log("promise catch error", err, err?.message, err?.stack);
   });
+
+  if (!parentContext) {
+    rootContexts.add(newContext);
+    const cleanupRoot = () => rootContexts.delete(newContext);
+    promiseProxy.handleCancel(cleanupRoot);
+    promiseProxy.finally(cleanupRoot);
+  }
 
   if (parentContext) {
     bp.finally(() => {

@@ -18,7 +18,7 @@ pub mod engine;
 #[cfg(test)]
 mod timing_tests;
 
-pub use context::{Ctx, BranchOptions, WaitError};
+pub use context::{Ctx, BranchOptions, BranchHandle, CancelHandlerUnsubscribe, WaitError};
 pub use engine::{Engine, SchedulerMode};
 pub use tempo::TempoMap;
 pub use barrier::{start_barrier, resolve_barrier, await_barrier};
