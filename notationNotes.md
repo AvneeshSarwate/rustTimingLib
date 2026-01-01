@@ -720,7 +720,42 @@ Engine::builder()
 
 ---
 
-## 8. Appendix: Full Macro Implementation
+## 8. Implementation Reality Check
+
+During implementation of `midi_demo_macro.rs`, we discovered an important constraint:
+
+**`ctx.branch()` requires `Future<Output = ()>`**, not `Result<(), WaitError>`.
+
+This means:
+- Branch closures must return `()`, not `Result`
+- You cannot use `?` to propagate errors out of a branch
+- Cancellation must be handled explicitly with `is_err()` checks or ignored
+
+**Practical consequence:** We use `w_!` (fire-and-forget) macros in branches:
+```rust
+ctx.branch(|c| async move {
+    // Use w_! which ignores cancellation
+    w_!(c, 1.0);
+    w_!(c, 2.0);
+    // No return value needed
+}, BranchOptions::default());
+```
+
+For branches that need to stop on cancellation, check explicitly:
+```rust
+ctx.branch(|c| async move {
+    if c.wait(1.0).await.is_err() {
+        return;  // Exit early on cancel
+    }
+    // Continue...
+}, BranchOptions::default());
+```
+
+This constraint is actually reasonable - branches are "fire and forget" tasks. If you need error propagation, use `branch_wait` which does return a `Result` that the parent can await.
+
+---
+
+## 9. Appendix: Full Macro Implementation
 
 Here is a complete, ready-to-use macro module:
 
@@ -798,7 +833,59 @@ macro_rules! branch_wait {
 
 ---
 
-## 9. Conclusion
+## 10. Ultra-Terse Implementation (midi_demo_proc.rs)
+
+The `midi_demo_proc.rs` file demonstrates the most aggressive terseness achievable with declarative macros. Here's the final syntax:
+
+### Core Macros
+```rust
+W!(c, 1.0);          // Wait 1 beat
+S!(c, 0.5);          // Wait 0.5 seconds
+X!(c);               // Break if cancelled
+L!(c, 10, {...});    // Loop 10 times with cancel check
+LOOP!(c, {...});     // Infinite loop with cancel check
+```
+
+### Fork Pattern (Key Insight)
+Due to Rust macro hygiene, the inner context must be explicitly named:
+```rust
+F!(ctx, [m, r], |c| {    // c is the inner context
+    W!(c, 1.0);          // Use c inside the block
+    m.on(60, 100);       // Captures are auto-cloned
+});
+```
+
+### Ultra-Short Shared State Types
+```rust
+V<T>     // Shared value: V::new(0.5), v.g(), v.s(x), v.m(|x| ...)
+Q<T>     // Message queue: Q::new(), q.push(x), q.pop()
+N        // Note set: N::new(), n.add(60), n.rm(60), n.has(60)
+P        // Params map: P::new(), p.s("key", 1.0), p.g("key")
+M        // MIDI wrapper: m.on(60, 100), m.off(60)
+```
+
+### Convention Summary
+1. Outer context (from RUN!) is `ctx`
+2. Inside F! blocks, use `|c|` to name the inner context as `c`
+3. All shared resources use single-letter types (V, Q, N, P, M)
+4. All wait macros are 1-2 characters (W!, S!, X!)
+
+### Example: Polyrhythm
+```rust
+RUN_WHILE!(90.0, "poly", r, |ctx| {
+    F!(ctx, [m, r], |c| {
+        L!(c, 24, {
+            X!(c); if !r.load(Ordering::Relaxed) { break; }
+            m.on(60, 100); W!(c, 0.1); m.off(60); W!(c, 1.23);
+        });
+    });
+    W!(ctx, 32.0);
+});
+```
+
+---
+
+## 11. Conclusion
 
 The fundamental tension is between:
 - **Rust's ownership/borrowing model** (safety, explicitness)

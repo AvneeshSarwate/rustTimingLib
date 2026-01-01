@@ -3,10 +3,22 @@ name = "rust_timing_lib"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = [".", "timing_macros"]
+
 [dependencies]
 spin_sleep = "1.2"
 midir = "0.10"
+timing_macros = { path = "./timing_macros" }
 
 [[bin]]
 name = "midi_demo"
 path = "src/bin/midi_demo.rs"
+
+[[bin]]
+name = "midi_demo_macro"
+path = "src/bin/midi_demo_macro.rs"
+
+[[bin]]
+name = "midi_demo_proc"
+path = "src/bin/midi_demo_proc.rs"
